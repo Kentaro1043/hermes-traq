@@ -3,20 +3,27 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import json
 import logging
+import mimetypes
 import re
+import uuid
 from collections import OrderedDict
+from pathlib import Path
 from urllib.parse import urlsplit
+from urllib.parse import urljoin
 
 import aiohttp
 from gateway.config import Platform
 from gateway.platforms._shared import extra_or_secret, get_scoped_secret, seed_extra_from_env
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import (BasePlatformAdapter, SendResult, cache_media_bytes_async,
+                                    _TEXT_INJECT_EXTENSIONS)
 from gateway.platforms.event import MessageEvent, MessageType
 
 log = logging.getLogger(__name__)
 LIMIT = 10000
+MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
 
 
 def csv(value):
@@ -150,11 +157,14 @@ class TraqAdapter(BasePlatformAdapter):
                 return embedded.get('raw', match.group())
             except (ValueError, AttributeError):
                 return match.group()
+        # The event's embedded file IDs are authoritative; ordinary user-provided
+        # URLs are never fetched using the bot's bearer token.
+        files = [e for e in message.get('embedded') or [] if e.get('type') == 'file']
         text = re.sub(r'!\{[^{}]*\}', unwrap, text)
         if self.me.get('name'):
             text = re.sub(pattern, '', text)
         text = text.strip()
-        if not text:
+        if not text and not files:
             return
         self.seen[mid] = None
         if len(self.seen) > 10000:
@@ -163,8 +173,60 @@ class TraqAdapter(BasePlatformAdapter):
         source = self.build_source(chat_id=chat_id, chat_type='dm' if is_dm else 'group', user_id=uid,
                                    user_name=user.get('name'), chat_name=chat_id, message_id=mid,
                                    role_authorized=True)
-        await self.handle_message(MessageEvent(text=text, message_type=MessageType.TEXT, source=source,
-                                               raw_message=envelope, message_id=mid))
+        media_urls, media_types, media_inlined, notes = await self._collect_files(files)
+        if notes:
+            text = '\n\n'.join([*notes, text] if text else notes)
+        if not text:
+            text = '(The user sent an attachment.)'
+        first_type = media_types[0] if media_types else ''
+        message_type = (MessageType.PHOTO if first_type.startswith('image/') else
+                        MessageType.AUDIO if first_type.startswith('audio/') else
+                        MessageType.VIDEO if first_type.startswith('video/') else
+                        MessageType.DOCUMENT if media_urls else MessageType.TEXT)
+        await self.handle_message(MessageEvent(text=text, message_type=message_type, source=source,
+                                               raw_message=envelope, message_id=mid,
+                                               media_urls=media_urls, media_types=media_types,
+                                               media_text_inlined=media_inlined))
+
+    async def _collect_files(self, files):
+        paths, types, inlined, notes = [], [], [], []
+        seen = set()
+        for item in files:
+            try:
+                file_id = str(uuid.UUID(str(item.get('id', ''))))
+                if file_id in seen:
+                    continue
+                seen.add(file_id)
+                info = await self.request('GET', f'/files/{file_id}/meta')
+                name = Path(info.get('name') or 'file.bin').name
+                mime = info.get('mime') or mimetypes.guess_type(name)[0] or 'application/octet-stream'
+                if info.get('size', 0) > MAX_ATTACHMENT_BYTES:
+                    raise ValueError('attachment exceeds 32 MiB')
+                async with self.http.get(self.origin + f'/api/v3/files/{file_id}') as response:
+                    response.raise_for_status()
+                    data = bytearray()
+                    async for chunk in response.content.iter_chunked(65536):
+                        data.extend(chunk)
+                        if len(data) > MAX_ATTACHMENT_BYTES:
+                            raise ValueError('attachment exceeds 32 MiB')
+                cached = await cache_media_bytes_async(bytes(data), filename=name, mime_type=mime)
+                if cached is None:
+                    raise ValueError('invalid attachment')
+                paths.append(cached.path)
+                types.append(cached.media_type)
+                is_inline = False
+                if cached.kind == 'document' and len(data) <= 100 * 1024 and (Path(name).suffix.lower() in _TEXT_INJECT_EXTENSIONS or mime.startswith('text/')):
+                    try:
+                        contents = data.decode('utf-8')
+                        notes.append(f"[Content of {cached.display_name}]:\n{contents}")
+                        is_inline = True
+                    except UnicodeDecodeError:
+                        pass
+                inlined.append(is_inline)
+            except Exception as exc:
+                log.warning('Unable to receive traQ attachment: %s', exc)
+                notes.append('[An attachment could not be downloaded or exceeded the size limit.]')
+        return paths, types, inlined, notes
 
     async def stamp(self, mid, name, method='POST'):
         stamp_id = self.stamps.get(name)
@@ -202,6 +264,76 @@ class TraqAdapter(BasePlatformAdapter):
         except Exception as exc:
             log.warning('traQ send failed', exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def _send_file(self, chat_id, file_obj, filename, caption=None):
+        try:
+            if chat_id.startswith('dm:'):
+                dm = await self.request('GET', f'/users/{chat_id[3:]}/dm-channel')
+                channel_id = dm['id']
+            else:
+                channel_id = chat_id
+            form = aiohttp.FormData()
+            form.add_field('channelId', channel_id)
+            form.add_field('file', file_obj, filename=filename,
+                           content_type=mimetypes.guess_type(filename)[0] or 'application/octet-stream')
+            info = await self.request('POST', '/files', data=form)
+            embed = '!' + json.dumps({'type': 'file', 'raw': filename, 'id': info['id']}, ensure_ascii=False, separators=(',', ':'))
+            content = (caption + '\n' if caption else '') + embed
+            return await self.send(chat_id, content)
+        except Exception as exc:
+            log.warning('traQ file upload failed', exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def _send_local_file(self, chat_id, file_path, caption=None, file_name=None):
+        try:
+            path = Path(file_path)
+            with path.open('rb') as file_obj:
+                return await self._send_file(chat_id, file_obj, Path(file_name or path.name).name, caption)
+        except (OSError, ValueError) as exc:
+            return SendResult(success=False, error=str(exc))
+
+    async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None, metadata=None):
+        return await self._send_local_file(chat_id, image_path, caption)
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, metadata=None):
+        return await self._send_local_file(chat_id, file_path, caption, file_name)
+
+    async def send_video(self, chat_id, video_path, caption=None, reply_to=None, metadata=None):
+        return await self._send_local_file(chat_id, video_path, caption)
+
+    async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None, metadata=None, **kwargs):
+        return await self._send_local_file(chat_id, audio_path, caption)
+
+    async def _send_remote_image(self, chat_id, url, caption, filename):
+        # A separate session must be used: self.http contains the traQ bearer token.
+        from tools.url_safety import is_safe_url
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                current = url
+                for _ in range(6):
+                    if not is_safe_url(current):
+                        raise ValueError('unsafe image URL')
+                    async with session.get(current, allow_redirects=False) as response:
+                        if response.status in (301, 302, 303, 307, 308):
+                            current = urljoin(current, response.headers['Location'])
+                            continue
+                        response.raise_for_status()
+                        data = bytearray()
+                        async for chunk in response.content.iter_chunked(65536):
+                            data.extend(chunk)
+                            if len(data) > MAX_ATTACHMENT_BYTES:
+                                raise ValueError('image exceeds 32 MiB')
+                        return await self._send_file(chat_id, io.BytesIO(data), filename, caption)
+                raise ValueError('too many image redirects')
+        except Exception as exc:
+            log.warning('Unable to attach remote image: %s', exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def send_image(self, chat_id, image_url, caption=None, reply_to=None, metadata=None):
+        return await self._send_remote_image(chat_id, image_url, caption, 'image' + (Path(urlsplit(image_url).path).suffix or '.png'))
+
+    async def send_animation(self, chat_id, animation_url, caption=None, reply_to=None, metadata=None):
+        return await self._send_remote_image(chat_id, animation_url, caption, 'animation.gif')
 
     async def edit_message(self, chat_id, message_id, content, *, finalize=False):
         if len(content) > LIMIT:

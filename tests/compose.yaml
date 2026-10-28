@@ -1,0 +1,39 @@
+services:
+  db:
+    image: mariadb:10.11
+    environment:
+      MARIADB_ROOT_PASSWORD: password
+      MARIADB_DATABASE: traq
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_general_ci"]
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh --connect --innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+  traq:
+    image: ghcr.io/traptitech/traq@sha256:e362c1eb05a107410e325314bdb4233a431cd302a7a4ae677553204ac1ff1de7
+    command: ["serve", "--dev", "--skip-init-emojis"]
+    environment:
+      TRAQ_ALLOWSIGNUP: "true"
+      TRAQ_ORIGIN: http://localhost:3000
+      TRAQ_MARIADB_HOST: db
+      TRAQ_MARIADB_USERNAME: root
+      TRAQ_MARIADB_PASSWORD: password
+      TRAQ_MARIADB_DATABASE: traq
+      TRAQ_STORAGE_TYPE: memory
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      default:
+        aliases: [hermes-traq-test-server]
+  smoke:
+    image: nousresearch/hermes-agent@sha256:9c5561579f3ffdf333401797094ac3a743738d6c25d40f4331c7bf77b694238d
+    user: hermes
+    entrypoint: ["/opt/hermes/.venv/bin/python3", "/tmp/smoke.py"]
+    working_dir: /opt/hermes
+    volumes:
+      - ./docker_smoke.py:/tmp/smoke.py:ro
+      - ../traq:/tmp/traq:ro
+    depends_on:
+      - traq
