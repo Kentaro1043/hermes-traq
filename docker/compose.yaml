@@ -33,7 +33,7 @@ services:
     entrypoint: ["/opt/hermes/.venv/bin/python3", "/tmp/smoke.py"]
     working_dir: /opt/hermes
     volumes:
-      - ./docker_smoke.py:/tmp/smoke.py:ro
+      - ../tests/docker_smoke.py:/tmp/smoke.py:ro
       - ../traq:/tmp/traq:ro
     depends_on:
       - traq

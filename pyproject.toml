@@ -1,0 +1,13 @@
+[project]
+name = "hermes-traq"
+version = "0.1.0"
+description = "traQ platform plugin for Hermes Gateway"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["aiohttp>=3.9"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"

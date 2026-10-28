@@ -73,8 +73,8 @@ class TraqAdapter(BasePlatformAdapter):
             self.me = await self.request('GET', '/users/me')
             try:
                 stamps = await self.request('GET', '/stamps')
-                self.stamps = {s['name']: s['id'] for s in stamps if s.get('name') in ('eyes', 'white_check_mark')}
-                for name in ('eyes', 'white_check_mark'):
+                self.stamps = {s['name']: s['id'] for s in stamps if s.get('name') in ('eyes', 'white_check_mark', 'x')}
+                for name in ('eyes', 'white_check_mark', 'x'):
                     if name not in self.stamps:
                         log.warning('traQ stamp %s is unavailable', name)
             except Exception:
@@ -252,6 +252,8 @@ class TraqAdapter(BasePlatformAdapter):
         await self.stamp(event.message_id, 'eyes', 'DELETE')
         if outcome == ProcessingOutcome.SUCCESS:
             await self.stamp(event.message_id, 'white_check_mark')
+        elif outcome == ProcessingOutcome.FAILURE:
+            await self.stamp(event.message_id, 'x')
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         path = '/users/' + chat_id[3:] + '/messages' if chat_id.startswith('dm:') else '/channels/' + chat_id + '/messages'

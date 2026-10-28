@@ -41,6 +41,7 @@ def load_adapter(monkeypatch):
     class Outcome(Enum):
         SUCCESS = 1
         FAILURE = 2
+        CANCELLED = 3
     modules['gateway.platforms.base'].BasePlatformAdapter = Base
     modules['gateway.platforms.base'].SendResult = SendResult
     modules['gateway.platforms.base'].ProcessingOutcome = Outcome
@@ -122,7 +123,7 @@ async def test_rest_delivery_and_reactions(adapter):
     import aiohttp
     adapter.origin = 'http://127.0.0.1:' + str(site._server.sockets[0].getsockname()[1])
     adapter.http = aiohttp.ClientSession()
-    adapter.stamps = {'eyes': 'eyes-id', 'white_check_mark': 'check-id'}
+    adapter.stamps = {'eyes': 'eyes-id', 'white_check_mark': 'check-id', 'x': 'x-id'}
     try:
         assert (await adapter.send('dm:user-id', 'hello')).success
         assert (await adapter.send('channel-id', 'x' * 10001)).success
@@ -135,6 +136,13 @@ async def test_rest_delivery_and_reactions(adapter):
         assert ('PUT', '/api/v3/messages/sent', {'content': 'progress', 'embed': False}) in calls
         assert ('POST', '/api/v3/messages/incoming/stamps/check-id', {'count': 1}) in calls
         assert ('DELETE', '/api/v3/messages/incoming/stamps/eyes-id', None) in calls
+        calls.clear()
+        await adapter.on_processing_complete(event, sys.modules['gateway.platforms.base'].ProcessingOutcome.FAILURE)
+        assert calls == [('DELETE', '/api/v3/messages/incoming/stamps/eyes-id', None),
+                         ('POST', '/api/v3/messages/incoming/stamps/x-id', {'count': 1})]
+        calls.clear()
+        await adapter.on_processing_complete(event, sys.modules['gateway.platforms.base'].ProcessingOutcome.CANCELLED)
+        assert calls == [('DELETE', '/api/v3/messages/incoming/stamps/eyes-id', None)]
     finally:
         await adapter.http.close()
         await runner.cleanup()
