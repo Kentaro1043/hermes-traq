@@ -1,0 +1,19 @@
+name: traq-platform
+label: traQ
+kind: platform
+version: 0.1.0
+description: traQ WebSocket Bot adapter for the Hermes Gateway.
+author: hermes-traq contributors
+requires_env:
+  - name: TRAQ_BOT_TOKEN
+    description: traQ WebSocket Bot access token
+    password: true
+optional_env:
+  - name: TRAQ_ORIGIN
+    description: traQ server origin (default https://q.trap.jp)
+  - name: TRAQ_ALLOWED_USERS
+    description: Comma-separated traQ user UUIDs; empty allows all users
+  - name: TRAQ_REQUIRE_MENTION
+    description: Require mentions in channels (default true)
+  - name: TRAQ_FREE_RESPONSE_CHANNELS
+    description: Comma-separated channel UUIDs that do not require mentions
